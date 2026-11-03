@@ -1082,10 +1082,12 @@ class DigitalIOController:
             key for key in CHANNEL_KEYS
             if key != backup_key or has_backup
         ]
-        resolved = {
-            key: self._match_do_channel(channels.get(key), normalize_physical_channel)
-            for key in active_keys
-        }
+        resolved = {}
+        for key in active_keys:
+            raw = channels.get(key)
+            if not (raw or "").strip():
+                continue
+            resolved[key] = self._match_do_channel(raw, normalize_physical_channel)
 
         pulse = CHANNEL_KEYS[int(op["pulse_index"])]
         fall = CHANNEL_KEYS[int(op["fall_index"])]
