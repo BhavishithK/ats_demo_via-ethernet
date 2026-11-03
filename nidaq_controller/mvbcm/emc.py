@@ -1,6 +1,8 @@
 """EMC immunity hold: steady analogs, 120 V on P1.6, trip/close every minute.
 
-TC1, TC2, CC, and Imtr stay at 12 mA. Iph is a 50 Hz sine at 160 mA RMS.
+TC1, TC2, CC, and Imtr stay at 12 mA. Iph is a 50 Hz sine at 160 mV RMS
+at the board. ``VoltageStimulus`` multiplies by the fixture scale of 11,
+so the 9264 is driven at 1.760 V RMS.
 P1.6 stays high so the fixture puts 120 V DC on Vctrl. Neither line is
 part of the trip map.
 
@@ -45,7 +47,7 @@ from nidaq_controller.mvbcm.stimuli.current import CurrentStimulus, find_9266
 from nidaq_controller.mvbcm.stimuli.voltage import VoltageStimulus, find_9264
 
 HOLD_MA = 12.0
-IPH_MA = 160.0
+IPH_MV = 160.0
 IPH_FS_A = 20.0
 IPH_FS_MV = 333.0
 FREQUENCY_HZ = 50.0
@@ -55,8 +57,8 @@ COIL_A = 25.0
 COIL_TOL_A = 0.25
 IMTR_A = 50.0
 IMTR_TOL_A = 1.0
-IPH_A = IPH_MA / 1000.0
-IPH_TOL_A = 0.05
+IPH_A = IPH_MV / IPH_FS_MV * IPH_FS_A
+IPH_TOL_A = 0.2
 VCTRL_V = 120.0
 VCTRL_TOL_V = 5.0
 
@@ -91,8 +93,8 @@ _CLOSED = {
 
 
 def iph_millivolts_rms() -> float:
-    """Board millivolts RMS for 160 mA on the 20 A / 333 mV iph scale."""
-    return (IPH_MA / 1000.0) / IPH_FS_A * IPH_FS_MV
+    """Board millivolts RMS. The 9264 writer applies the ×11 step-down."""
+    return IPH_MV
 
 
 def _current_channels() -> list[MappedChannel]:
