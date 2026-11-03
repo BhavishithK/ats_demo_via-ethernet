@@ -4,11 +4,13 @@ TC1, TC2, CC, and Imtr stay at 12 mA. Iph is a 50 Hz sine at 160 mA RMS.
 P1.6 stays high so the fixture puts 120 V DC on Vctrl. Neither line is
 part of the trip map.
 
-Every 7 s the live ``rms_eng`` values are scored. After each Trip and Close
-the script expects one new ``operations.recent`` row and the
-matching counter to increase by one. A ``fault`` or ``motor_run`` row, or
-a move in ``fault_total`` / ``motor_run_count``, fails. This module is not
-called from the main MV BCM run.
+Every 7 s the live ``rms_eng`` values are scored. Trip is at 0 s and close
+is at 10 s. After each pulse the script polls until the new
+``operations.recent`` row and the matching counter arrive, or until 10 s
+after that pulse. The close pulse does not move earlier if the trip row
+is already in. A ``fault`` or ``motor_run`` row, or a move in
+``fault_total`` / ``motor_run_count``, fails. This module is not called
+from the main MV BCM run.
 """
 
 from __future__ import annotations
@@ -59,13 +61,13 @@ VCTRL_V = 120.0
 VCTRL_TOL_V = 5.0
 
 CYCLE_S = 60.0
-STEP_S = 7.0
-# RMS ticks inside one minute. The next minute starts at CYCLE_S.
-RMS_MARKS = tuple(float(second) for second in range(0, int(CYCLE_S), int(STEP_S)))
-# (offset seconds, play kind, expected rec_slot, counter that must increase)
+RMS_STEP_S = 7.0
+OP_GAP_S = 10.0
+POLL_S = 0.5
+# (pulse offset, score deadline, play kind, expected rec_slot, counter +1)
 OPS = (
-    (0.0, "trip", "trip", "trip_total"),
-    (STEP_S, "close", "close", "close_total"),
+    (0.0, OP_GAP_S, "trip", "trip", "trip_total"),
+    (OP_GAP_S, OP_GAP_S * 2, "close", "close", "close_total"),
 )
 RMS_SPECS = (
     ("tc1", COIL_A, COIL_TOL_A, "A"),
@@ -195,11 +197,10 @@ def run_emc(
 def _run_cycle(
     fetch, board, controller, resolved, stop_event, should_stop, cycle_no, on_row,
 ) -> list[dict]:
-    """One minute: RMS every 7 s, trip then close on their marks."""
-    ops = {offset: (kind, slot, counter) for offset, kind, slot, counter in OPS}
-    pending: dict[str, Any] | None = None
+    """One minute. Trip at 0 s, close at 10 s. Poll each event for 10 s."""
     rows: list[dict] = []
     cycle_t0 = time.perf_counter()
+    rms_at = 0.0
 
     def _emit(batch: list[dict]) -> None:
         rows.extend(batch)
@@ -207,26 +208,90 @@ def _run_cycle(
             for row in batch:
                 on_row(row)
 
-    for mark in RMS_MARKS:
-        _wait_until(cycle_t0 + mark, should_stop, stop_event)
-        if pending is not None:
+    def _score_due_rms(payload, error) -> None:
+        nonlocal rms_at
+        now = time.perf_counter()
+        while rms_at < CYCLE_S and now + 0.05 >= cycle_t0 + rms_at:
+            _emit(_score_rms(payload, error, cycle_no, rms_at))
+            rms_at += RMS_STEP_S
+            if rms_at >= CYCLE_S or now + 0.05 < cycle_t0 + rms_at:
+                break
             payload, error = _read_live(fetch, board)
-            _emit(_score_operation(payload, error, pending, cycle_no))
-            pending = None
-        payload, error = _read_live(fetch, board)
-        _emit(_score_rms(payload, error, cycle_no, mark))
-        op = ops.get(mark)
-        if op is None:
-            continue
-        kind, slot, counter = op
+
+    for pulse_at, deadline, kind, slot, counter in OPS:
+        _wait_until(cycle_t0 + pulse_at, should_stop, stop_event)
         pending = _start_operation(
             fetch, board, controller, resolved, stop_event, kind, slot, counter,
         )
-    _wait_until(cycle_t0 + CYCLE_S, should_stop, stop_event)
-    if pending is not None:
+        passed = _poll_operation(
+            fetch, board, pending, cycle_t0 + deadline, stop_event, should_stop,
+            _score_due_rms,
+        )
+        _emit(_score_operation(passed[0], passed[1], pending, cycle_no))
+        _wait_until(cycle_t0 + deadline, should_stop, stop_event)
+    while rms_at < CYCLE_S:
+        _wait_until(cycle_t0 + rms_at, should_stop, stop_event)
         payload, error = _read_live(fetch, board)
-        _emit(_score_operation(payload, error, pending, cycle_no))
+        _score_due_rms(payload, error)
+    _wait_until(cycle_t0 + CYCLE_S, should_stop, stop_event)
     return rows
+
+
+def _poll_operation(fetch, board, pending, deadline, stop_event, should_stop, on_sample):
+    """Poll until ``deadline``. The first sample that matches is the score.
+
+    An early match does not end the wait. The next pulse stays on its mark,
+    and RMS samples that fall inside the window are still taken.
+    """
+    payload, error = None, None
+    passed = None
+    while time.perf_counter() < deadline:
+        _raise_if_stopped(should_stop)
+        if stop_event.is_set():
+            raise MvbcmStopped("stopped by user")
+        payload, error = _read_live(fetch, board)
+        on_sample(payload, error)
+        if passed is None and _operation_ready(payload, pending):
+            passed = (payload, error)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        _sleep(min(POLL_S, remaining), should_stop, stop_event)
+    if passed is not None:
+        return passed
+    return payload, error
+
+
+def _operation_ready(payload, pending: dict) -> bool:
+    """True when the one new row and the counters match this command."""
+    if payload is None or pending.get("before_ts") is None or pending.get("drive_error") is not None:
+        return False
+    if not isinstance(pending.get("before"), dict):
+        return False
+    fresh = [
+        row for row in _rows_after(payload, pending["before_ts"])
+        if str(row.get("rec_slot") or "").lower() != "backup_trip"
+    ]
+    slots = [str(row.get("rec_slot") or "").lower() for row in fresh]
+    if slots != [pending["slot"]] or any(name in UNWANTED_SLOTS for name in slots):
+        return False
+    before = pending["before"]
+    try:
+        for name in COUNTERS:
+            got = int(b7_value(payload, name))
+            expect = before[name] + (1 if name == pending["counter"] else 0)
+            if got != expect:
+                return False
+        for name in QUIET:
+            if int(b7_value(payload, name)) != before[name]:
+                return False
+    except (LiveError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _sleep(seconds: float, should_stop, stop_event: threading.Event) -> None:
+    _wait_until(time.perf_counter() + seconds, should_stop, stop_event)
 
 
 def _start_operation(fetch, board, controller, resolved, stop_event, kind, slot, counter) -> dict:
