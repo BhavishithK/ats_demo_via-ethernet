@@ -172,6 +172,20 @@
             margin-top: 8px; max-height: 220px; overflow-y: auto;
             font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.45;
         }
+        .live-check-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .live-check-field {
+            display: flex; flex-direction: column; gap: 4px;
+            font-size: 12px; color: #aaa;
+        }
+        .live-check-field input, .live-check-field select { width: 100%; }
+        .live-check-hint {
+            color: #888; font-size: 12px; margin-top: 8px; line-height: 1.45;
+        }
 
         .log-container {
             background: #0d1b2a; border-radius: 6px; padding: 12px;
@@ -546,6 +560,7 @@
             } else {
                 document.getElementById('deviceCount').textContent = 'Devices: 0';
                 document.getElementById('statusBar').textContent = 'No devices — click Refresh to scan';
+                if (!document.getElementById('live-check')) mountLiveCheckTab([]);
             }
         }
 
@@ -566,6 +581,7 @@
                     }
                     document.getElementById('deviceCount').textContent = 'Devices: 0';
                     document.getElementById('statusBar').textContent = 'Scan failed';
+                    if (!document.getElementById('live-check')) mountLiveCheckTab([]);
                 }
                 return;
             }
@@ -1982,7 +1998,210 @@
                 panelsContainer.appendChild(panel);
             });
             applyAllAoViews();
+            mountLiveCheckTab(devices);
             resumeMvbcmIfRunning();
+        }
+
+        const LIVE_CHECK_ANALOG = [
+            ['tc1', 'mA'],
+            ['tc2', 'mA'],
+            ['cc', 'mA'],
+            ['imtr', 'mA'],
+            ['iph', 'mV RMS'],
+            ['vctrl', 'V'],
+        ];
+        const LIVE_CHECK_DIGITAL = ['trip', 'backtrip', 'close', '52a', '52b'];
+
+        function liveCheckStore(key) {
+            try {
+                const raw = JSON.parse(localStorage.getItem(key) || '{}');
+                return raw && typeof raw === 'object' ? raw : {};
+            } catch {
+                return {};
+            }
+        }
+
+        function liveCheckHtml() {
+            const savedIp = localStorage.getItem('mvbcm_board_ip') || '';
+            const savedAnalog = liveCheckStore('live_check_analog');
+            const savedDigital = liveCheckStore('live_check_digital');
+            const analog = LIVE_CHECK_ANALOG.map(([signal, unit]) => `
+                <label class="live-check-field">${signal} (${unit})
+                    <input type="number" id="live_check_ai_${signal}" step="any"
+                        value="${escAttr(savedAnalog[signal] ?? '')}"
+                        placeholder="0" onchange="saveLiveCheckInputs()">
+                </label>`).join('');
+            const digital = LIVE_CHECK_DIGITAL.map((signal) => {
+                const on = savedDigital[signal] === 'on';
+                return `
+                <label class="live-check-field">${signal}
+                    <select id="live_check_di_${signal}" onchange="saveLiveCheckInputs()">
+                        <option value="off" ${on ? '' : 'selected'}>OFF</option>
+                        <option value="on" ${on ? 'selected' : ''}>ON</option>
+                    </select>
+                </label>`;
+            }).join('');
+            return `
+                <div class="mvbcm-panel" style="margin:16px;">
+                    <div class="dio-module-toolbar">
+                        <span style="color:#00d4ff;font-size:13px;">Live check</span>
+                        <label style="font-size:12px;color:#aaa;">Board IP
+                            <input id="live_check_ip" value="${escAttr(savedIp)}"
+                                placeholder="192.168.1.50" style="width:160px;margin-left:6px;"
+                                onchange="saveLiveCheckInputs()">
+                        </label>
+                        <button class="btn-warning btn-sm" id="live_check_start" onclick="startLiveCheck()">Start</button>
+                        <button class="btn-danger btn-sm" id="live_check_stop" onclick="stopLiveCheck()" disabled>Stop</button>
+                    </div>
+                    <div style="color:#00d4ff;font-size:12px;margin-top:8px;">Analog input</div>
+                    <div class="live-check-grid">${analog}</div>
+                    <div style="color:#00d4ff;font-size:12px;margin-top:10px;">Digital</div>
+                    <div class="live-check-grid">${digital}</div>
+                    <p class="live-check-hint">Blank is 0, then the test-script conversion. tc1/tc2/cc: (mA−4)/16×50 A ±0.25. imtr: (mA−4)/16×100 A ±1. iph: mV/333×20 A ±0.2. vctrl: volts ±5. Digital blank is OFF.</p>
+                    <div class="trip-wave-meta" id="live_check_status">Idle</div>
+                    <div class="mvbcm-log" id="live_check_log"></div>
+                </div>`;
+        }
+
+        function mountLiveCheckTab(devices) {
+            const tabContainer = document.getElementById('tabContainer');
+            const panelsContainer = document.getElementById('devicePanels');
+            const btn = document.createElement('button');
+            btn.id = 'live_check_tab';
+            btn.className = 'tab-btn';
+            btn.textContent = 'Live Check';
+            btn.onclick = () => switchChassisTab('live-check', btn);
+            const buttons = [...tabContainer.querySelectorAll('.tab-btn')];
+            let after = null;
+            devices.forEach((device, di) => {
+                if ((device.connection_type || '') === 'USB') after = buttons[di + 1] || null;
+            });
+            if (after && after.nextSibling) tabContainer.insertBefore(btn, after.nextSibling);
+            else tabContainer.appendChild(btn);
+            const panel = document.createElement('div');
+            panel.id = 'live-check';
+            panel.className = 'tab-panel-chassis';
+            panel.innerHTML = liveCheckHtml();
+            panelsContainer.appendChild(panel);
+            if (currentTab === 'live-check') switchChassisTab('live-check', btn);
+            resumeLiveCheckIfRunning();
+        }
+
+        function saveLiveCheckInputs() {
+            const analog = {};
+            for (const [signal] of LIVE_CHECK_ANALOG) {
+                analog[signal] = document.getElementById(`live_check_ai_${signal}`)?.value ?? '';
+            }
+            const digital = {};
+            for (const signal of LIVE_CHECK_DIGITAL) {
+                digital[signal] = document.getElementById(`live_check_di_${signal}`)?.value || 'off';
+            }
+            localStorage.setItem('live_check_analog', JSON.stringify(analog));
+            localStorage.setItem('live_check_digital', JSON.stringify(digital));
+            const ip = document.getElementById('live_check_ip');
+            if (ip) localStorage.setItem('mvbcm_board_ip', ip.value.trim());
+        }
+
+        function readLiveCheckBody() {
+            saveLiveCheckInputs();
+            const analog = {};
+            for (const [signal] of LIVE_CHECK_ANALOG) {
+                analog[signal] = document.getElementById(`live_check_ai_${signal}`)?.value ?? '';
+            }
+            const digital = {};
+            for (const signal of LIVE_CHECK_DIGITAL) {
+                digital[signal] = document.getElementById(`live_check_di_${signal}`)?.value || 'off';
+            }
+            return {
+                board: (document.getElementById('live_check_ip')?.value || '').trim(),
+                analog,
+                digital,
+            };
+        }
+
+        function paintLiveCheck(data) {
+            const statusEl = document.getElementById('live_check_status');
+            const logEl = document.getElementById('live_check_log');
+            const startBtn = document.getElementById('live_check_start');
+            const stopBtn = document.getElementById('live_check_stop');
+            if (!statusEl) return false;
+            if (startBtn) startBtn.disabled = !!data.running;
+            if (stopBtn) stopBtn.disabled = !data.running;
+            const tail = data.error ? ` — ${data.error}` : '';
+            if (data.running) {
+                statusEl.textContent = `Running · ${data.rows.length} result(s)`;
+            } else if (data.done) {
+                statusEl.textContent = data.stopped
+                    ? `Stopped · ${data.passed} pass, ${data.failed} fail${tail}`
+                    : `${data.passed} pass, ${data.failed} fail${tail}`;
+            } else {
+                statusEl.textContent = 'Idle';
+            }
+            if (logEl) {
+                logEl.innerHTML = (data.rows || []).map(mvbcmRowHtml).join('');
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            return true;
+        }
+
+        async function pollLiveCheck() {
+            if (window._liveCheckPoll) clearInterval(window._liveCheckPoll);
+            const tick = async () => {
+                if (!document.getElementById('live_check_status')) {
+                    clearInterval(window._liveCheckPoll);
+                    window._liveCheckPoll = null;
+                    return;
+                }
+                const data = await apiCall('/api/live-check/status', 'GET', null, 8000, true);
+                if (!data) return;
+                paintLiveCheck(data);
+                if (!data.running) {
+                    clearInterval(window._liveCheckPoll);
+                    window._liveCheckPoll = null;
+                }
+            };
+            await tick();
+            window._liveCheckPoll = setInterval(tick, 500);
+        }
+
+        async function resumeLiveCheckIfRunning() {
+            const data = await apiCall('/api/live-check/status', 'GET', null, 4000, true);
+            if (!data || !document.getElementById('live_check_status')) return;
+            if (!data.running && !data.done) return;
+            if (data.running) pollLiveCheck();
+            else paintLiveCheck(data);
+        }
+
+        async function startLiveCheck() {
+            const body = readLiveCheckBody();
+            if (!body.board) {
+                showToast('Enter the board IP', 'error');
+                return;
+            }
+            const logEl = document.getElementById('live_check_log');
+            if (logEl) logEl.innerHTML = '';
+            const statusEl = document.getElementById('live_check_status');
+            const startBtn = document.getElementById('live_check_start');
+            const stopBtn = document.getElementById('live_check_stop');
+            if (statusEl) statusEl.textContent = 'Starting…';
+            if (startBtn) startBtn.disabled = true;
+            if (stopBtn) stopBtn.disabled = false;
+            const started = await apiCall('/api/live-check/start', 'POST', body, 15000);
+            if (!started) {
+                if (statusEl) statusEl.textContent = 'Idle';
+                if (startBtn) startBtn.disabled = false;
+                if (stopBtn) stopBtn.disabled = true;
+                return;
+            }
+            pollLiveCheck();
+        }
+
+        async function stopLiveCheck() {
+            const stopBtn = document.getElementById('live_check_stop');
+            if (stopBtn) stopBtn.disabled = true;
+            const statusEl = document.getElementById('live_check_status');
+            if (statusEl) statusEl.textContent = 'Stopping…';
+            await apiCall('/api/live-check/stop', 'POST', {}, 8000);
         }
 
         function setAoView(di, mi, view) {

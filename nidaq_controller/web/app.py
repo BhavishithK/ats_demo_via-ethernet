@@ -69,6 +69,16 @@ _ao_locks_guard = threading.Lock()
 _dio_controllers: dict = {}
 _mvbcm_lock = threading.Lock()
 _mvbcm_stop = threading.Event()
+_live_check_lock = threading.Lock()
+_live_check_stop = threading.Event()
+_live_check_state = {
+    'running': False,
+    'done': False,
+    'stopped': False,
+    'error': '',
+    'rows': [],
+    'board': '',
+}
 _mvbcm_state = {
     'running': False,
     'done': False,
@@ -2004,6 +2014,130 @@ def api_do_test_ports():
         })
     except Exception as e:
         return _api_error('DO test-ports', e, di=di, mi=mi)
+
+
+def _live_check_snapshot() -> dict:
+    with _live_check_lock:
+        rows = list(_live_check_state['rows'])
+        passed, failed = _mvbcm_counts(rows)
+        return {
+            'running': _live_check_state['running'],
+            'done': _live_check_state['done'],
+            'stopped': _live_check_state['stopped'],
+            'error': _live_check_state['error'],
+            'rows': rows,
+            'passed': passed,
+            'failed': failed,
+            'board': _live_check_state['board'],
+        }
+
+
+@app.route('/api/live-check/status')
+def api_live_check_status():
+    """API: Live-check rows scored so far."""
+    return jsonify(_live_check_snapshot())
+
+
+@app.route('/api/live-check/stop', methods=['POST'])
+def api_live_check_stop():
+    """API: Stop the live-check poll and append rows to the MV BCM CSV."""
+    with _live_check_lock:
+        running = _live_check_state['running']
+    if not running:
+        return jsonify({'stopped': False, 'message': 'No live check running'})
+    _live_check_stop.set()
+    add_log('Live check stop requested')
+    return jsonify({'stopped': True})
+
+
+@app.route('/api/live-check/start', methods=['POST'])
+def api_live_check_start():
+    """API: Poll GET /api/live and score every analog and digital channel."""
+    data, err = _parse_json()
+    if err:
+        return err
+    try:
+        board = _board_url(data.get('board', ''))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    try:
+        try:
+            from nidaq_controller.mvbcm.live_check import parse_inputs
+        except ModuleNotFoundError:
+            from mvbcm.live_check import parse_inputs
+        analog, digital = parse_inputs(data.get('analog'), data.get('digital'))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    with _live_check_lock:
+        if _live_check_state['running']:
+            return jsonify({'error': 'A live check is already running'}), 409
+        _live_check_stop.clear()
+        _live_check_state.update({
+            'running': True,
+            'done': False,
+            'stopped': False,
+            'error': '',
+            'rows': [],
+            'board': board,
+        })
+
+    def _worker():
+        try:
+            from nidaq_controller.mvbcm.live import LiveError
+            from nidaq_controller.mvbcm.live_check import (
+                DEFAULT_RESULTS,
+                append_results,
+                fetch_and_score,
+                live_error_row,
+            )
+        except ModuleNotFoundError:
+            from mvbcm.live import LiveError
+            from mvbcm.live_check import (
+                DEFAULT_RESULTS,
+                append_results,
+                fetch_and_score,
+                live_error_row,
+            )
+
+        step = 0
+        try:
+            while not _live_check_stop.is_set():
+                step += 1
+                try:
+                    batch = fetch_and_score(board, analog, digital, step)
+                except LiveError as exc:
+                    batch = [live_error_row(step, str(exc))]
+                except Exception as exc:
+                    add_log(f'Live check failed: {exc}', 'ERROR')
+                    with _live_check_lock:
+                        _live_check_state['error'] = str(exc)
+                    break
+                with _live_check_lock:
+                    _live_check_state['rows'].extend(batch)
+                if _live_check_stop.wait(5.0):
+                    break
+        finally:
+            with _live_check_lock:
+                kept = list(_live_check_state['rows'])
+                _live_check_state['running'] = False
+                _live_check_state['done'] = True
+                _live_check_state['stopped'] = _live_check_stop.is_set()
+            if kept:
+                try:
+                    with _mvbcm_lock:
+                        append_results(DEFAULT_RESULTS, kept)
+                except Exception as exc:
+                    add_log(f'Live check CSV save failed: {exc}', 'ERROR')
+                    with _live_check_lock:
+                        if not _live_check_state['error']:
+                            _live_check_state['error'] = f'CSV save failed: {exc}'
+            passed, failed = _mvbcm_counts(kept)
+            add_log(f'Live check finished: {passed} pass, {failed} fail')
+
+    add_log(f'Live check started -> {board}')
+    threading.Thread(target=_worker, name='live-check', daemon=True).start()
+    return jsonify({'started': True, 'board': board})
 
 
 @app.route('/api/log')
